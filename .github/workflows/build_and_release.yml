@@ -1,0 +1,107 @@
+# .github/workflows/build_and_release.yml
+name: Build and Release
+
+on:
+  pull_request:
+    types: [opened, reopened]
+  push:
+  workflow_dispatch:
+
+# Default to read-only permissions.
+permissions:
+  contents: read
+
+jobs:
+  pre_job:
+    runs-on: ubuntu-latest
+
+    # If a commit and its tag trigger separate workflows,
+    # prefer the tag workflow.
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+
+    # Grant only the permissions required by the skip-check action.
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'always'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule"]'
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: pre_job
+
+    # Run normal builds unless a duplicate is detected.
+    # Always allow the tag workflow to build firmware.
+    if: >-
+      needs.pre_job.outputs.should_skip == 'false' ||
+      (
+        needs.pre_job.outputs.should_skip == 'true' &&
+        github.ref_type == 'tag'
+      )
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [migrator, bridge]
+
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      platform: ${{ matrix.platform }}
+
+    # Remove this if the reusable workflow does not need secrets.
+    secrets: inherit
+
+  release:
+    name: Release
+    needs: build
+
+    # Only publish releases for version tags beginning with "v".
+    if: >-
+      github.ref_type == 'tag' &&
+      startsWith(github.ref, 'refs/tags/v')
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo for CHANGELOG
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: firmware
+          merge-multiple: true
+
+      - name: Verify firmware artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for platform in migrator bridge; do
+            file="firmware/firmware_${platform}.bin"
+
+            if [[ ! -s "$file" ]]; then
+            echo "::error::Missing or empty firmware artifact: $file"
+            exit 1
+            fi
+          done
+
+          echo "Firmware artifacts:"
+          ls -lh firmware/*.bin
+
+      - name: Create release
+        uses: ncipollo/release-action@v1.21.0
+        with:
+          allowUpdates: true
+          artifacts: "firmware/*.bin"
+          bodyFile: "change_log.md"
+          removeArtifacts: true
