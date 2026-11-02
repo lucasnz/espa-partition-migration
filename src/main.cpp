@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <Preferences.h>
+#include <RemoteDebug.h>
 #include <cstring>
 #include <cstddef>
 
@@ -21,9 +22,15 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
+// Remote diagnostics are available over Telnet on TCP port 23 once Wi-Fi starts.
+RemoteDebug Debug;
+
 namespace {
 
 // Flash layout supplied by the user.
+constexpr char kRemoteDebugHostname[] = "espa-migration";
+constexpr uint16_t kRemoteDebugPort = 23;
+
 constexpr uint32_t kPartitionTableOffset = 0x8000;
 constexpr uint32_t kFlashSectorSize = 0x1000;
 constexpr uint32_t kExpectedFlashSize = 0x800000;
@@ -129,6 +136,7 @@ bool commitRequested = false;
 bool restartRequested = false;
 bool fallbackApStarted = false;
 bool networkStarted = false;
+bool remoteDebugStarted = false;
 String uploadError;
 String updateError;
 uint8_t activeWifiMode = WIFI_MODE_STA;
@@ -204,7 +212,7 @@ private:
         esp_err_t err = esp_flash_erase_region(
             esp_flash_default_chip, address_, kFlashSectorSize);
         if (err != ESP_OK) {
-            Serial.printf("Flash erase failed at 0x%08lX: %s\n",
+            debugE("Flash erase failed at 0x%08lX: %s",
                           static_cast<unsigned long>(address_), esp_err_to_name(err));
             return false;
         }
@@ -212,7 +220,7 @@ private:
         err = esp_flash_write(
             esp_flash_default_chip, block_, address_, sizeof(block_));
         if (err != ESP_OK) {
-            Serial.printf("Flash write failed at 0x%08lX: %s\n",
+            debugE("Flash write failed at 0x%08lX: %s",
                           static_cast<unsigned long>(address_), esp_err_to_name(err));
             return false;
         }
@@ -250,7 +258,7 @@ bool writeFlash(uint32_t address, const void *source, size_t length) {
 
 bool eraseFlash(uint32_t address, size_t length) {
     if ((address % kFlashSectorSize) || (length % kFlashSectorSize)) {
-        Serial.printf("Unaligned flash erase request: address=0x%08lX length=0x%lX\n",
+        debugE("Unaligned flash erase request: address=0x%08lX length=0x%lX",
                       static_cast<unsigned long>(address),
                       static_cast<unsigned long>(length));
         return false;
@@ -259,7 +267,7 @@ bool eraseFlash(uint32_t address, size_t length) {
     const esp_err_t err = esp_flash_erase_region(
         esp_flash_default_chip, address, static_cast<uint32_t>(length));
     if (err != ESP_OK) {
-        Serial.printf("Flash erase failed: address=0x%08lX length=0x%lX error=%s (0x%x)\n",
+        debugE("Flash erase failed: address=0x%08lX length=0x%lX error=%s (0x%x)",
                       static_cast<unsigned long>(address),
                       static_cast<unsigned long>(length),
                       esp_err_to_name(err), static_cast<unsigned>(err));
@@ -303,7 +311,7 @@ bool copyStringFromPreferences(Preferences &prefs,
                                size_t capacity) {
     String value = prefs.getString(key, fallback);
     if (value.length() >= capacity) {
-        Serial.printf("Preference '%s' is too long for migration buffer\n", key);
+        debugW("Preference '%s' is too long for migration buffer", key);
         return false;
     }
     memcpy(destination, value.c_str(), value.length() + 1);
@@ -318,7 +326,7 @@ bool exportSettingsAndWifi(MigrationBlob &blob) {
 
     Preferences prefs;
     if (!prefs.begin("eSpa-config", true)) {
-        Serial.println("Cannot open Preferences namespace eSpa-config for backup");
+        debugE("Cannot open Preferences namespace eSpa-config for backup");
         return false;
     }
 
@@ -343,13 +351,13 @@ bool exportSettingsAndWifi(MigrationBlob &blob) {
     blob.wifiMode = blob.softAPAlwaysOn ? WIFI_MODE_APSTA : WIFI_MODE_STA;
 
     if (esp_wifi_get_config(WIFI_IF_STA, &blob.staConfig) != ESP_OK) {
-        Serial.println("Unable to read station Wi-Fi configuration");
+        debugE("Unable to read station Wi-Fi configuration");
         return false;
     }
     blob.staConfigValid = 1;
 
     if (esp_wifi_get_config(WIFI_IF_AP, &blob.apConfig) != ESP_OK) {
-        Serial.println("Unable to read SoftAP Wi-Fi configuration");
+        debugE("Unable to read SoftAP Wi-Fi configuration");
         return false;
     }
     blob.apConfigValid = 1;
@@ -365,10 +373,10 @@ bool verifyDefaultPartitionTable() {
         true,
         &count);
     if (err != ESP_OK) {
-        Serial.printf("Embedded default_8MB partition table is invalid: %s\n", esp_err_to_name(err));
+        debugE("Embedded default_8MB partition table is invalid: %s", esp_err_to_name(err));
         return false;
     }
-    Serial.printf("Embedded default_8MB partition table verified (%d entries)\n", count);
+    debugI("Embedded default_8MB partition table verified (%d entries)", count);
     return true;
 }
 
@@ -377,7 +385,7 @@ bool verifyStagedBridgeImage(uint32_t *imageLength = nullptr) {
     esp_image_metadata_t metadata = {};
     const esp_err_t err = esp_image_verify(ESP_IMAGE_VERIFY, &position, &metadata);
     if (err != ESP_OK) {
-        Serial.printf("Staged bridge image verification failed: %s\n", esp_err_to_name(err));
+        debugE("Staged bridge image verification failed: %s", esp_err_to_name(err));
         return false;
     }
     if (metadata.image_len == 0 || metadata.image_len > kNewAppSize) return false;
@@ -432,30 +440,30 @@ bool backupOldState(const MigrationBlob &blob) {
             reinterpret_cast<const esp_partition_info_t *>(partitionTableWork),
             true,
             &oldTableEntries) != ESP_OK) {
-        Serial.println("Current partition table failed validation; refusing migration");
+        debugE("Current partition table failed validation; refusing migration");
         return false;
     }
 
     if (!eraseFlash(kScratchBase, kScratchSize)) {
-        Serial.println("Could not erase migration scratch area");
+        debugE("Could not erase migration scratch area");
         return false;
     }
 
     const uint32_t sourceTableCrc = crc32(partitionTableWork, sizeof(partitionTableWork));
     uint32_t sourceNvsCrc = 0;
     if (!crcFlashRegion(kOldNvsOffset, kOldNvsSize, sourceNvsCrc)) {
-        Serial.println("Could not checksum old NVS before backup");
+        debugE("Could not checksum old NVS before backup");
         return false;
     }
 
     if (!writeFlash(kBlobOffset, &blob, sizeof(blob)) ||
         !writeFlash(kOldTableBackupOffset, partitionTableWork, sizeof(partitionTableWork))) {
-        Serial.println("Could not write settings or partition-table backup");
+        debugE("Could not write settings or partition-table backup");
         return false;
     }
 
     if (!copyFlashRegion(kOldNvsOffset, kOldNvsBackupOffset, kOldNvsSize)) {
-        Serial.println("Could not back up old NVS partition");
+        debugE("Could not back up old NVS partition");
         return false;
     }
 
@@ -464,7 +472,7 @@ bool backupOldState(const MigrationBlob &blob) {
     if (!crcFlashRegion(kOldNvsBackupOffset, kOldNvsSize, backupNvsCrc) ||
         !crcFlashRegion(kOldTableBackupOffset, kFlashSectorSize, backupTableCrc) ||
         backupNvsCrc != sourceNvsCrc || backupTableCrc != sourceTableCrc) {
-        Serial.println("NVS or partition-table backup failed source comparison");
+        debugE("NVS or partition-table backup failed source comparison");
         return false;
     }
 
@@ -486,11 +494,11 @@ bool backupOldState(const MigrationBlob &blob) {
     MigrationJournal verifyJournal;
     MigrationBlob verifyBlob;
     if (!readJournal(verifyJournal, &verifyBlob)) {
-        Serial.println("Migration backup verification failed");
+        debugE("Migration backup verification failed");
         return false;
     }
 
-    Serial.println("Preferences, Wi-Fi configuration, old NVS and old partition table backed up");
+    debugI("Preferences, Wi-Fi configuration, old NVS and old partition table backed up");
     return true;
 }
 
@@ -513,7 +521,7 @@ bool restoreOldPartitionTableFromBackup() {
     esp_err_t err = esp_flash_set_dangerous_write_protection(
         esp_flash_default_chip, false);
     if (err != ESP_OK) {
-        Serial.printf("Could not disable dangerous-write guard for old table restore: %s\n",
+        debugE("Could not disable dangerous-write guard for old table restore: %s",
                       esp_err_to_name(err));
         return false;
     }
@@ -525,7 +533,7 @@ bool restoreOldPartitionTableFromBackup() {
     const esp_err_t protectErr = esp_flash_set_dangerous_write_protection(
         esp_flash_default_chip, true);
     if (protectErr != ESP_OK) {
-        Serial.printf("WARNING: could not re-enable dangerous-write guard after old table restore: %s\n",
+        debugW("WARNING: could not re-enable dangerous-write guard after old table restore: %s",
                       esp_err_to_name(protectErr));
         return false;
     }
@@ -536,17 +544,17 @@ bool restoreOldPartitionTableFromBackup() {
     const esp_err_t verifyErr = esp_partition_table_verify(
         reinterpret_cast<const esp_partition_info_t *>(partitionTableWork), true, &count);
     if (verifyErr != ESP_OK) {
-        Serial.printf("Restored old partition table failed validation: %s\n",
+        debugE("Restored old partition table failed validation: %s",
                       esp_err_to_name(verifyErr));
         return false;
     }
-    Serial.printf("Old partition table restored and verified (%d entries)\n", count);
+    debugI("Old partition table restored and verified (%d entries)", count);
     return true;
 }
 
 void clearMigrationScratch() {
     if (!eraseFlash(kScratchBase, kScratchSize)) {
-        Serial.println("Warning: could not clear migration scratch/coredump area");
+        debugW("Warning: could not clear migration scratch/coredump area");
     }
 }
 
@@ -563,7 +571,7 @@ bool writeNewOtaData() {
         const uint32_t address = kNewOtaDataOffset + sector * kFlashSectorSize;
         if (!eraseFlash(address, kFlashSectorSize) ||
             !writeFlash(address, &entry, sizeof(entry))) {
-            Serial.printf("Failed writing new OTA data sector %lu\n", static_cast<unsigned long>(sector));
+            debugE("Failed writing new OTA data sector %lu", static_cast<unsigned long>(sector));
             return false;
         }
 
@@ -572,7 +580,7 @@ bool writeNewOtaData() {
             verify.ota_seq != entry.ota_seq ||
             verify.crc != entry.crc ||
             verify.ota_state != ESP_OTA_IMG_UNDEFINED) {
-            Serial.println("New OTA data read-back verification failed");
+            debugE("New OTA data read-back verification failed");
             return false;
         }
     }
@@ -589,7 +597,7 @@ bool writeNewPartitionTable() {
     esp_err_t err = esp_flash_set_dangerous_write_protection(
         esp_flash_default_chip, false);
     if (err != ESP_OK) {
-        Serial.printf("Could not disable dangerous-write guard for partition-table commit: %s (0x%x)\n",
+        debugE("Could not disable dangerous-write guard for partition-table commit: %s (0x%x)",
                       esp_err_to_name(err), static_cast<unsigned>(err));
         return false;
     }
@@ -605,12 +613,12 @@ bool writeNewPartitionTable() {
     const esp_err_t protectErr = esp_flash_set_dangerous_write_protection(
         esp_flash_default_chip, true);
     if (protectErr != ESP_OK) {
-        Serial.printf("WARNING: could not re-enable dangerous-write guard after partition-table commit: %s (0x%x)\n",
+        debugW("WARNING: could not re-enable dangerous-write guard after partition-table commit: %s (0x%x)",
                       esp_err_to_name(protectErr), static_cast<unsigned>(protectErr));
         return false;
     }
     if (!tableWritten) {
-        Serial.println("Could not erase/write new partition table");
+        debugE("Could not erase/write new partition table");
         return false;
     }
 
@@ -621,12 +629,12 @@ bool writeNewPartitionTable() {
     err = esp_partition_table_verify(
         reinterpret_cast<const esp_partition_info_t *>(partitionTableWork), true, &count);
     if (err != ESP_OK || memcmp(partitionTableWork, kDefault8MBPartitionTable, kPartitionTableVerifySize) != 0) {
-        Serial.printf("New partition table failed read-back verification: %s\n",
+        debugE("New partition table failed read-back verification: %s",
                       esp_err_to_name(err));
         return false;
     }
 
-    Serial.printf("New partition table installed and verified (%d entries)\n", count);
+    debugI("New partition table installed and verified (%d entries)", count);
     return true;
 }
 
@@ -690,7 +698,7 @@ bool restoreWifiConfig(const MigrationBlob &blob) {
     // Temporarily enable both interfaces so both stored interface configs can
     // be restored even when the desired post-migration mode is STA-only.
     if (!WiFi.mode(WIFI_MODE_APSTA)) {
-        Serial.println("Could not enable AP+STA while restoring Wi-Fi configuration");
+        debugE("Could not enable AP+STA while restoring Wi-Fi configuration");
         return false;
     }
 
@@ -699,7 +707,7 @@ bool restoreWifiConfig(const MigrationBlob &blob) {
         const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA,
                                                    const_cast<wifi_config_t *>(&blob.staConfig));
         if (err != ESP_OK) {
-            Serial.printf("Station Wi-Fi restore failed: %s\n", esp_err_to_name(err));
+            debugE("Station Wi-Fi restore failed: %s", esp_err_to_name(err));
             ok = false;
         }
     }
@@ -707,7 +715,7 @@ bool restoreWifiConfig(const MigrationBlob &blob) {
         const esp_err_t err = esp_wifi_set_config(WIFI_IF_AP,
                                                    const_cast<wifi_config_t *>(&blob.apConfig));
         if (err != ESP_OK) {
-            Serial.printf("SoftAP Wi-Fi restore failed: %s\n", esp_err_to_name(err));
+            debugE("SoftAP Wi-Fi restore failed: %s", esp_err_to_name(err));
             ok = false;
         }
     }
@@ -733,14 +741,14 @@ bool restoreWifiConfig(const MigrationBlob &blob) {
     // Apply the desired operating mode only after both interface configs
     // have been restored and verified.
     if (!WiFi.mode(mode)) {
-        Serial.println("Could not apply saved post-migration Wi-Fi mode");
+        debugE("Could not apply saved post-migration Wi-Fi mode");
         ok = false;
     }
 
     if ((mode & WIFI_MODE_STA) && blob.staConfigValid) {
         const esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-            Serial.printf("Station connect request failed: %s\n", esp_err_to_name(err));
+            debugE("Station connect request failed: %s", esp_err_to_name(err));
             ok = false;
         }
     }
@@ -756,20 +764,20 @@ bool importMigrationSettings() {
     MigrationJournal journal;
     alignas(4) MigrationBlob blob;
     if (!readJournal(journal, &blob)) {
-        Serial.println("No valid migration backup found in scratch area");
+        debugE("No valid migration backup found in scratch area");
         return false;
     }
 
     if (!restorePreferences(blob)) {
-        Serial.println("Preferences restore/verification failed");
+        debugE("Preferences restore/verification failed");
         return false;
     }
     if (!saveWifiModeMarker(blob.wifiMode)) {
-        Serial.println("Could not save migrated Wi-Fi mode marker");
+        debugE("Could not save migrated Wi-Fi mode marker");
         return false;
     }
     if (!restoreWifiConfig(blob)) {
-        Serial.println("Wi-Fi configuration restore/verification failed");
+        debugE("Wi-Fi configuration restore/verification failed");
         return false;
     }
 
@@ -779,7 +787,7 @@ bool importMigrationSettings() {
 
     settingsRestored = true;
     clearMigrationScratch();
-    Serial.println("Preferences and Wi-Fi settings restored successfully");
+    debugI("Preferences and Wi-Fi settings restored successfully");
     return true;
 }
 
@@ -859,21 +867,21 @@ void recoverInterruptedOldLayoutMigration() {
 
     // If the old layout still booted, the partition-table commit did not finish.
     // Restore the exact old NVS bytes before starting Wi-Fi/Preferences again.
-    Serial.println("Found an interrupted pre-commit migration; restoring old NVS");
+    debugW("Found an interrupted pre-commit migration; restoring old NVS");
     if (!restoreOldNvsFromBackup()) {
-        Serial.println("CRITICAL: old NVS recovery failed; leaving migration backup intact");
+        debugE("CRITICAL: old NVS recovery failed; leaving migration backup intact");
         settingsRestoreFailed = true;
         return;
     }
     clearMigrationScratch();
-    Serial.println("Old NVS restored. Restarting before normal startup.");
+    debugI("Old NVS restored. Restarting before normal startup.");
     delay(250);
     ESP.restart();
 }
 
 void startFallbackAccessPoint() {
     if (fallbackApStarted) return;
-    Serial.println("Starting fallback migration access point");
+    debugI("Starting fallback migration access point");
     WiFi.mode(WIFI_MODE_APSTA);
     WiFi.softAPConfig(IPAddress(169,254,1,1), IPAddress(169,254,1,1), IPAddress(255,255,255,0));
     WiFi.softAP(MIGRATION_FALLBACK_AP_SSID, MIGRATION_FALLBACK_AP_PASSWORD);
@@ -1416,23 +1424,23 @@ void installRoutes() {
 }
 
 bool performMigrationCommit() {
-    Serial.println("Starting one-time partition migration commit");
+    debugI("Starting one-time partition migration commit");
 
     if (esp_flash_encryption_enabled()) {
-        Serial.println("Flash encryption is enabled; raw migration is disabled for safety");
+        debugW("Flash encryption is enabled; raw migration is disabled for safety");
         return false;
     }
 
     uint32_t flashSize = 0;
     if (esp_flash_get_size(esp_flash_default_chip, &flashSize) != ESP_OK ||
         flashSize != kExpectedFlashSize) {
-        Serial.printf("Unexpected flash size: %lu (expected 8 MB)\n",
+        debugE("Unexpected flash size: %lu (expected 8 MB)",
                       static_cast<unsigned long>(flashSize));
         return false;
     }
 
     if (!isOldLayoutRunning() || !verifyStagedBridgeImage() || !verifyDefaultPartitionTable()) {
-        Serial.println("Pre-commit validation failed");
+        debugE("Pre-commit validation failed");
         return false;
     }
 
@@ -1440,51 +1448,67 @@ bool performMigrationCommit() {
     // before the fallback AP can alter the temporary runtime AP config.
     // No credentials are logged.
     if (!migrationSettingsBackupReady) {
-        Serial.println("Preferences/Wi-Fi backup is not ready; migration cancelled");
+        debugE("Preferences/Wi-Fi backup is not ready; migration cancelled");
         return false;
     }
     alignas(4) MigrationBlob settingsBackup = migrationSettingsBackup;
 
     // Stop Wi-Fi before taking the raw NVS snapshot because Wi-Fi itself stores
     // settings in NVS. The application settings are already held in RAM.
-    WiFi.mode(WIFI_OFF);
-    (void)esp_wifi_stop();
-    (void)esp_wifi_deinit();
-    const esp_err_t nvsErr = nvs_flash_deinit();
-    if (nvsErr != ESP_OK) {
-        Serial.printf("nvs_flash_deinit failed: %s\n", esp_err_to_name(nvsErr));
-        return false; // No flash has been erased or changed yet.
-    }
-
-    if (!backupOldState(settingsBackup)) {
-        Serial.println("Could not create verified migration backup; old NVS/table remain intact");
+    // IMPORTANT: Arduino's WiFi.mode(WIFI_OFF) already calls esp_wifi_stop()
+    // and esp_wifi_deinit() internally. Do not call either IDF function again.
+    debugI("Stopping Wi-Fi (current mode=%d)...", static_cast<int>(WiFi.getMode()));
+    if (!WiFi.mode(WIFI_OFF)) {
+        debugE("WiFi.mode(WIFI_OFF) failed; aborting before flash changes");
         return false;
     }
+    debugI("Wi-Fi stopped and deinitialised by Arduino WiFi layer");
+
+    debugI("Deinitialising NVS...");
+    const esp_err_t nvsErr = nvs_flash_deinit();
+    if (nvsErr != ESP_OK) {
+        debugE("nvs_flash_deinit failed: %s (0x%x)",
+                      esp_err_to_name(nvsErr), static_cast<unsigned>(nvsErr));
+        return false; // No flash has been erased or changed yet.
+    }
+    debugI("NVS deinitialised");
+
+    debugI("Backing up old partition table, NVS and settings...");
+    if (!backupOldState(settingsBackup)) {
+        debugE("Could not create verified migration backup; old NVS/table remain intact");
+        return false;
+    }
+    debugI("Old state backup verified");
 
     // The new NVS region is the first 0x5000 bytes of the old NVS partition.
     // The final 0x2000 bytes become the new OTA-data partition.
+    debugI("Erasing old NVS region (0x9000, 0x7000)...");
     if (!eraseFlash(kOldNvsOffset, kOldNvsSize)) {
-        Serial.println("Could not erase old NVS area");
+        debugE("Could not erase old NVS area");
         if (restoreOldNvsFromBackup()) clearMigrationScratch();
         return false;
     }
+    debugI("Old NVS region erased");
 
+    debugI("Preparing new OTA metadata at 0xE000...");
     if (!writeNewOtaData()) {
-        Serial.println("Could not prepare new OTA selection data; restoring old NVS");
+        debugE("Could not prepare new OTA selection data; restoring old NVS");
         if (restoreOldNvsFromBackup()) clearMigrationScratch();
         return false;
     }
+    debugI("New OTA metadata written and verified");
 
     // This is the commit point. OTA data and the bridge image are already ready.
+    debugI("Committing new partition table at 0x8000...");
     if (!writeNewPartitionTable()) {
-        Serial.println("Partition-table commit failed; attempting to restore old layout");
+        debugE("Partition-table commit failed; attempting to restore old layout");
         const bool nvsRestored = restoreOldNvsFromBackup();
         const bool tableRestored = restoreOldPartitionTableFromBackup();
         if (nvsRestored && tableRestored) clearMigrationScratch();
         return false;
     }
 
-    Serial.println("Partition migration committed. Rebooting into bridge at 0x340000.");
+    debugI("Partition migration committed. Rebooting into bridge at 0x340000.");
     delay(500);
     ESP.restart();
     return true;
@@ -1493,29 +1517,28 @@ bool performMigrationCommit() {
 } // namespace
 
 void setup() {
-    Serial.begin(115200);
     delay(300);
-    Serial.println();
-    Serial.println("eSpa combined migrator / bridge starting");
+    WiFi.setHostname(kRemoteDebugHostname);
+    debugI("eSpa combined migrator / bridge starting");
 
     if (esp_flash_encryption_enabled()) {
-        Serial.println("WARNING: flash encryption is enabled; migration commit will be refused.");
+        debugW("WARNING: flash encryption is enabled; migration commit will be refused.");
     }
 
     runningPartition = esp_ota_get_running_partition();
     if (!runningPartition) {
-        Serial.println("FATAL: unable to identify running application partition");
+        debugE("FATAL: unable to identify running application partition");
         return;
     }
 
-    Serial.printf("Running partition: %s @ 0x%08lX size 0x%08lX\n",
+    debugI("Running partition: %s @ 0x%08lX size 0x%08lX",
                   runningPartition->label,
                   static_cast<unsigned long>(runningPartition->address),
                   static_cast<unsigned long>(runningPartition->size));
 
     if (runningPartition->address == kNewApp1Offset && checkNewLayout()) {
         isBridge = true;
-        Serial.println("Detected default_8MB bridge role");
+        debugI("Detected default_8MB bridge role");
 
         MigrationJournal journal;
         if (readJournal(journal)) {
@@ -1523,12 +1546,12 @@ void setup() {
             // and Wi-Fi settings have both been restored and verified.
             if (!importMigrationSettings()) {
                 settingsRestoreFailed = true;
-                Serial.println("Settings restore failed; retaining backup and starting recovery AP");
+                debugE("Settings restore failed; retaining backup and starting recovery AP");
                 startFallbackAccessPoint();
             }
         } else if (!startWifiFromMigratedNvs()) {
             settingsRestoreFailed = true;
-            Serial.println("No valid migration backup/marker; starting recovery AP");
+            debugW("No valid migration backup/marker; starting recovery AP");
             startFallbackAccessPoint();
         }
 
@@ -1537,7 +1560,7 @@ void setup() {
         }
     } else if (isOldLayoutRunning()) {
         isBridge = false;
-        Serial.println("Detected espa-v2 migrator role");
+        debugI("Detected espa-v2 migrator role");
         recoverInterruptedOldLayoutMigration();
         bridgeImageStaged = verifyStagedBridgeImage();
 
@@ -1547,7 +1570,7 @@ void setup() {
         // saved SoftAP, and allows both configs to be backed up. The desired
         // post-migration mode comes from SoftAPAlwaysOn in Preferences.
         if (!WiFi.mode(WIFI_MODE_APSTA)) {
-            Serial.println("Could not start AP+STA; falling back to STA mode");
+            debugE("Could not start AP+STA; falling back to STA mode");
             WiFi.mode(WIFI_MODE_STA);
             activeWifiMode = WIFI_MODE_STA;
         } else {
@@ -1560,24 +1583,53 @@ void setup() {
         // fallback AP operation can change the runtime AP credentials.
         migrationSettingsBackupReady = exportSettingsAndWifi(migrationSettingsBackup);
         if (!migrationSettingsBackupReady) {
-            Serial.println("Could not snapshot Preferences/Wi-Fi settings; commit will be disabled");
+            debugE("Could not snapshot Preferences/Wi-Fi settings; commit will be disabled");
         }
         // The original Wi-Fi configuration is now cached in RAM. Keep the
         // fallback AP from persisting temporary credentials into old NVS.
         WiFi.persistent(false);
     } else {
-        Serial.println("FATAL: running partition does not match either supported layout");
+        debugE("FATAL: running partition does not match either supported layout");
         return;
     }
+
+    // RemoteDebug needs an active Wi-Fi interface. Start it after the migrator
+    // or bridge has configured STA/AP mode. Use Telnet-only transport so this
+    // small firmware does not need ESPAsyncWebServer alongside WebServer.
+#ifndef DEBUG_DISABLED
+    remoteDebugStarted = Debug.begin(
+        kRemoteDebugHostname, kRemoteDebugPort, RemoteDebug::INFO);
+    if (remoteDebugStarted) {
+        Debug.showDebugLevel(true);
+        Debug.showTime(true);
+        Debug.showProfiler(false);
+        debugI("RemoteDebug started on TCP port %u", kRemoteDebugPort);
+        debugI("eSpa migration firmware ready; role=%s",
+               isBridge ? "bridge" : "migrator");
+        debugI("Running partition: %s @ 0x%08lX size 0x%08lX",
+               runningPartition->label,
+               static_cast<unsigned long>(runningPartition->address),
+               static_cast<unsigned long>(runningPartition->size));
+        debugI("Settings restored=%s, migration backup ready=%s",
+               settingsRestored ? "yes" : "no",
+               migrationSettingsBackupReady ? "yes" : "no");
+    }
+#endif
 
     installRoutes();
     server.begin();
     networkStartMillis = millis();
-    Serial.println("Migration HTTP server listening on port 80");
-    Serial.printf("Fallback AP, if needed: %s\n", MIGRATION_FALLBACK_AP_SSID);
+    debugI("Migration HTTP server listening on port 80");
+    debugI("Fallback AP, if needed: %s", MIGRATION_FALLBACK_AP_SSID);
 }
 
 void loop() {
+#ifndef DEBUG_DISABLED
+    if (remoteDebugStarted) {
+        Debug.handle();
+    }
+#endif
+
     server.handleClient();
 
     if (commitRequested) {
@@ -1586,7 +1638,7 @@ void loop() {
         delay(300);
         const bool ok = performMigrationCommit();
         if (!ok) {
-            Serial.println("Migration commit failed; restoring old NVS if necessary and rebooting");
+            debugE("Migration commit failed; restoring old NVS if necessary and rebooting");
             // If the journal exists, restore the old NVS/table. This also covers
             // errors after NVS was erased but before the partition table changed.
             MigrationJournal journal;

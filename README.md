@@ -232,3 +232,17 @@ Wi-Fi station/AP credentials are saved separately from Preferences using the ESP
 - [ESP-IDF partition table documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html) — partition table format and generation.
 - [ESP-IDF `esp_flash_partitions.h`](https://github.com/espressif/esp-idf/blob/master/components/bootloader_support/include/esp_flash_partitions.h) — OTA selector record and partition-table verification structures.
 - [ESP-IDF `bootloader_common_loader.c`](https://sourcevu.sysprogs.com/espressif/esp-idf/files/components/bootloader_support/src/bootloader_common_loader.c) — OTA selector CRC is calculated over `ota_seq` with `esp_rom_crc32_le(UINT32_MAX, ..., 4)`.
+
+## RemoteDebug diagnostics
+
+The migrator and bridge use the `lucasnz/RemoteDebug` library for firmware log output; they do not print application diagnostics to `Serial`. PlatformIO installs the library through `lib_deps`.
+
+After the device has configured Wi-Fi, connect to its RemoteDebug Telnet console on TCP port 23:
+
+```bash
+telnet <ESP32-IP> 23
+```
+
+The migration web interface remains available on HTTP port 80. RemoteDebug is started after the Wi-Fi interface is configured, so messages emitted before that point (for example, very early boot or settings-restore messages) cannot be streamed to a client. The migration commit deliberately turns Wi-Fi off before deinitialising NVS; therefore, logs emitted during that offline flash-commit window cannot reach RemoteDebug. The firmware reports startup state again after reboot.
+
+RemoteDebug is Telnet and is not encrypted. Keep this temporary firmware on a trusted network.
