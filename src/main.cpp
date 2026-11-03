@@ -997,6 +997,29 @@ const char kMigrationPage[] PROGMEM = R"HTML(<!doctype html>
   let current = null;
   let busy = false;
   let polling = false;
+  let hostRedirectPrompted = false;
+
+  function isIpAddress(host) {
+    const value = host.replace(/^\[|\]$/g, '');
+    const octets = value.split('.');
+    if (octets.length === 4 && octets.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)) return true;
+    if (!value.includes(':')) return false;
+    try {
+      new URL(`http://[${value}]`);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  function promptIpAddress(data) {
+    if (hostRedirectPrompted || isIpAddress(window.location.hostname) || !data.staIp) return;
+    hostRedirectPrompted = true;
+    if (confirm(`This page was opened using a hostname. Navigate to the server IP address ${data.staIp}?`)) {
+      const target = new URL(window.location.href);
+      target.hostname = data.staIp;
+      window.location.assign(target.href);
+    }
+  }
 
   function log(message, isError = false) {
     const stamp = new Date().toLocaleTimeString();
@@ -1039,6 +1062,7 @@ const char kMigrationPage[] PROGMEM = R"HTML(<!doctype html>
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       current = data;
+    promptIpAddress(data);
       $('connectionDot').className = 'dot online';
       $('connectionText').textContent = 'Device online';
       setText('role', data.role || 'Unknown');
